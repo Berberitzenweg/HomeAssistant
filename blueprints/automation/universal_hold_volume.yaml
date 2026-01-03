@@ -1,0 +1,283 @@
+blueprint:
+  name: Universal Button-Hold → Media Player Volume (Time-Based Steps, Move/Stop, Min/Max, Timeout)
+  description: >
+    Universeller Blueprint: Lautstärke eines Media Players per "gedrückt halten" steuern.
+    Controller-Entity liefert Move-Up / Move-Down / Stop als State-Werte.
+    Schrittweite ist zeitbasiert: bis X ms Step klein, danach Step groß.
+    Min/Max gelten nur für die Tasterbedienung (kein hartes Clamp, wenn Player außerhalb liegt).
+    Mit Auto-Stop (Timeout).
+  domain: automation
+
+  input:
+    media_player:
+      name: Media Player
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+
+    controller_entity:
+      name: Controller-/Taster-Entity
+      description: Entity, deren Zustand die konfigurierten Werte für Lauter/Leiser/Stop liefert.
+      selector:
+        entity: {}
+
+    action_value_up:
+      name: Lauter – Entity-Wert
+      default: brightness_move_up
+      selector:
+        text: {}
+
+    action_value_down:
+      name: Leiser – Entity-Wert
+      default: brightness_move_down
+      selector:
+        text: {}
+
+    action_value_stop:
+      name: Stop – Entity-Wert
+      default: brightness_stop
+      selector:
+        text: {}
+
+    min_volume_percent:
+      name: Mindestlautstärke (%)
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+          mode: slider
+          step: 1
+
+    max_volume_percent:
+      name: Maximallautstärke per Taster (%)
+      description: >
+        Beim Erhöhen wird nur bis zu diesem Wert geregelt. Liegt der Player bereits darüber,
+        wird beim Erhöhen nichts verändert (kein Herunterklemmen).
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+          mode: slider
+          step: 1
+
+    step_short_percent:
+      name: Schrittweite kurz (% pro Tick)
+      description: "Schrittweite solange die Taste kürzer als die Schwellzeit gehalten wird."
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 20
+          unit_of_measurement: "%"
+          mode: slider
+          step: 1
+
+    step_long_percent:
+      name: Schrittweite lang (% pro Tick)
+      description: "Schrittweite ab Überschreiten der Schwellzeit."
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 30
+          unit_of_measurement: "%"
+          mode: slider
+          step: 1
+
+    step_switch_ms:
+      name: Schwellzeit (ms)
+      description: "Bis unterhalb dieses Zeitpunkts gilt 'kurz', ab dann 'lang'."
+      default: 3500
+      selector:
+        number:
+          min: 100
+          max: 30000
+          unit_of_measurement: "ms"
+          mode: slider
+          step: 100
+
+    rate_up_ms:
+      name: Lauter – Wiederholrate (ms)
+      default: 200
+      selector:
+        number:
+          min: 100
+          max: 2000
+          unit_of_measurement: "ms"
+          mode: slider
+          step: 50
+
+    rate_down_ms:
+      name: Leiser – Wiederholrate (ms)
+      default: 200
+      selector:
+        number:
+          min: 100
+          max: 2000
+          unit_of_measurement: "ms"
+          mode: slider
+          step: 50
+
+    safety_timeout_s:
+      name: Auto-Stop Timeout (Sekunden)
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: "s"
+          mode: slider
+          step: 1
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input controller_entity
+    to: !input action_value_up
+  - platform: state
+    entity_id: !input controller_entity
+    to: !input action_value_down
+  - platform: state
+    entity_id: !input controller_entity
+    to: !input action_value_stop
+
+variables:
+  player: !input media_player
+  ctrl: !input controller_entity
+  up_val: !input action_value_up
+  down_val: !input action_value_down
+  stop_val: !input action_value_stop
+
+  min_pct: !input min_volume_percent
+  max_pct: !input max_volume_percent
+
+  step_short_pct: !input step_short_percent
+  step_long_pct: !input step_long_percent
+  switch_ms: !input step_switch_ms
+
+  rate_up: !input rate_up_ms
+  rate_down: !input rate_down_ms
+  timeout_s: !input safety_timeout_s
+
+  min_vol: "{{ (min_pct | float(0)) / 100 }}"
+  max_vol: "{{ (max_pct | float(30)) / 100 }}"
+  step_short: "{{ (step_short_pct | float(1)) / 100 }}"
+  step_long: "{{ (step_long_pct | float(2)) / 100 }}"
+
+action:
+  - choose:
+      # ----------------------
+      # LAUTER (HOLD)
+      # ----------------------
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.to_state.state == up_val }}"
+        sequence:
+          - variables:
+              start_ts: "{{ as_timestamp(now()) }}"
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ (as_timestamp(now()) - (start_ts | float(0))) < (timeout_s | float(10)) }}"
+                - condition: template
+                  value_template: "{{ not is_state(ctrl, stop_val) }}"
+                - condition: template
+                  value_template: "{{ not is_state(ctrl, down_val) }}"
+              sequence:
+                - variables:
+                    current: "{{ state_attr(player, 'volume_level') }}"
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ current is number }}"
+                      sequence:
+                        - variables:
+                            cur: "{{ current | float }}"
+                            elapsed_ms: "{{ (as_timestamp(now()) - (start_ts | float(0))) * 1000 }}"
+                            step_cur: >-
+                              {% if (elapsed_ms | float(0)) < (switch_ms | float(3500)) %}
+                                {{ step_short | float }}
+                              {% else %}
+                                {{ step_long | float }}
+                              {% endif %}
+                            # Erhöhen nur, wenn unter max_vol; wenn bereits darüber: nichts ändern
+                            new: >-
+                              {% if cur >= (max_vol | float) %}
+                                {{ cur }}
+                              {% else %}
+                                {{ [cur + (step_cur | float), (max_vol | float)] | min }}
+                              {% endif %}
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  value_template: "{{ (new - cur) | abs > 0.0001 }}"
+                              sequence:
+                                - service: media_player.volume_set
+                                  data:
+                                    entity_id: "{{ player }}"
+                                    volume_level: "{{ new }}"
+                - delay:
+                    milliseconds: "{{ rate_up | int(200) }}"
+
+      # ----------------------
+      # LEISER (HOLD)
+      # ----------------------
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.to_state.state == down_val }}"
+        sequence:
+          - variables:
+              start_ts: "{{ as_timestamp(now()) }}"
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ (as_timestamp(now()) - (start_ts | float(0))) < (timeout_s | float(10)) }}"
+                - condition: template
+                  value_template: "{{ not is_state(ctrl, stop_val) }}"
+                - condition: template
+                  value_template: "{{ not is_state(ctrl, up_val) }}"
+              sequence:
+                - variables:
+                    current: "{{ state_attr(player, 'volume_level') }}"
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ current is number }}"
+                      sequence:
+                        - variables:
+                            cur: "{{ current | float }}"
+                            elapsed_ms: "{{ (as_timestamp(now()) - (start_ts | float(0))) * 1000 }}"
+                            step_cur: >-
+                              {% if (elapsed_ms | float(0)) < (switch_ms | float(3500)) %}
+                                {{ step_short | float }}
+                              {% else %}
+                                {{ step_long | float }}
+                              {% endif %}
+                            # Senken nur bis min_vol; wenn bereits darunter: nichts ändern
+                            new: >-
+                              {% if cur <= (min_vol | float) %}
+                                {{ cur }}
+                              {% else %}
+                                {{ [cur - (step_cur | float), (min_vol | float)] | max }}
+                              {% endif %}
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  value_template: "{{ (new - cur) | abs > 0.0001 }}"
+                              sequence:
+                                - service: media_player.volume_set
+                                  data:
+                                    entity_id: "{{ player }}"
+                                    volume_level: "{{ new }}"
+                - delay:
+                    milliseconds: "{{ rate_down | int(200) }}"
+
+    # STOP: keine Aktion nötig – stop_val triggert restart und bricht die Schleife sofort ab.
+    default: []
