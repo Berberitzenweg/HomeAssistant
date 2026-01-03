@@ -1,5 +1,5 @@
 blueprint:
-  name: Universal Button-Hold → Media Player Volume (Time-Based Steps, Move/Stop, Min/Max, Timeout)
+  name: Universal Volume Button
   description: >
     Universeller Blueprint: Lautstärke eines Media Players per "gedrückt halten" steuern.
     Controller-Entity liefert Move-Up / Move-Down / Stop als State-Werte.
