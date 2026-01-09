@@ -1,0 +1,254 @@
+blueprint:
+  name: "KNX Raumtemperatur (Mittelwert) + Rückschreiben auf Gruppenadressen"
+  description: >
+    Fasst mehrere Temperatur-Sensoren eines Raums zusammen (Mittelwert, ignoriert unknown/unavailable),
+    schreibt den Mittelwert in einen input_number und gibt ihn optional über KNX Expose und/oder knx.send
+    auf eine oder mehrere Gruppenadressen zurück.
+  domain: automation
+
+  input:
+    temperature_sensors:
+      name: "Temperatur-Sensoren (Quelle)"
+      description: "Alle Temperatursensoren dieses Raums auswählen."
+      selector:
+        entity:
+          multiple: true
+          reorder: true
+          filter:
+            - domain: sensor
+              device_class: temperature
+
+    room_temperature_helper:
+      name: "Raumtemperatur-Helfer (input_number)"
+      description: >
+        input_number, in den der Mittelwert geschrieben wird (deine 'echte' Raumtemperatur in HA).
+        Lege pro Raum einen Helfer an, z.B. input_number.wohnzimmer_raumtemperatur.
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+
+    decimals:
+      name: "Rundung (Nachkommastellen)"
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 3
+          step: 1
+          mode: slider
+
+    min_sources:
+      name: "Mindestanzahl gültiger Sensoren"
+      description: "Wenn weniger gültige Werte vorhanden sind, wird nichts geschrieben/gesendet."
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: slider
+
+    valid_min:
+      name: "Plausibilitätsgrenze Minimum (°C)"
+      default: -40
+      selector:
+        number:
+          min: -50
+          max: 50
+          step: 1
+
+    valid_max:
+      name: "Plausibilitätsgrenze Maximum (°C)"
+      default: 80
+      selector:
+        number:
+          min: 0
+          max: 120
+          step: 1
+
+    min_delta:
+      name: "Mindeständerung für Update (°C)"
+      description: "Bei Sensor-Triggern wird nur aktualisiert, wenn sich der Mittelwert mindestens so stark ändert."
+      default: 0.1
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.1
+
+    knx_group_addresses:
+      name: "KNX Gruppenadressen (Rückschreiben)"
+      description: "Liste der GAs, z.B. 2/1/10, 2/1/11, 2/1/12"
+      default: []
+      selector:
+        text:
+          multiple: true
+
+    knx_type:
+      name: "KNX DPT Type"
+      description: "Üblicherweise: temperature (DPT 9.001)."
+      default: "temperature"
+      selector:
+        text:
+
+    use_expose:
+      name: "KNX Expose nutzen (empfohlen)"
+      description: "Registriert Exposures beim Start: sendet bei Änderungen und beantwortet Read-Requests."
+      default: true
+      selector:
+        boolean:
+
+    respond_to_read:
+      name: "Auf GroupValueRead antworten (Expose)"
+      default: true
+      selector:
+        boolean:
+
+    expose_cooldown:
+      name: "Expose Cooldown (Sekunden)"
+      description: "Minimale Zeit zwischen zwei gesendeten Telegrammen je Adresse (0 = aus)."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 3600
+          step: 1
+
+    periodic_resend_minutes:
+      name: "Zyklisches Senden per knx.send (Minuten)"
+      description: "0 = aus. Wenn >0, wird zusätzlich zyklisch per knx.send geschrieben, auch ohne Wertänderung."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 240
+          step: 1
+
+mode: queued
+max: 10
+
+triggers:
+  - trigger: state
+    entity_id: !input temperature_sensors
+    id: sensors_changed
+
+  - trigger: time_pattern
+    minutes: "/1"
+    id: periodic
+
+  - trigger: homeassistant
+    event: start
+    id: ha_start
+
+actions:
+  - variables:
+      temp_entities: !input temperature_sensors
+      helper_entity: !input room_temperature_helper
+      decimals: !input decimals
+      min_sources: !input min_sources
+      valid_min: !input valid_min
+      valid_max: !input valid_max
+      min_delta: !input min_delta
+
+      knx_addresses: !input knx_group_addresses
+      knx_type: !input knx_type
+      use_expose: !input use_expose
+      respond_to_read: !input respond_to_read
+      expose_cooldown: !input expose_cooldown
+
+      periodic_minutes: !input periodic_resend_minutes
+      do_periodic: >-
+        {{ trigger.id == 'periodic'
+           and (periodic_minutes | int(0)) > 0
+           and (now().minute % (periodic_minutes | int(0))) == 0 }}
+
+  # 1) Exposures beim Start registrieren (eine pro GA)
+  - choose:
+      - conditions: "{{ trigger.id == 'ha_start' and use_expose and (knx_addresses | length > 0) }}"
+        sequence:
+          - repeat:
+              for_each: "{{ knx_addresses }}"
+              sequence:
+                - action: knx.exposure_register
+                  data:
+                    address: "{{ repeat.item }}"
+                    type: "{{ knx_type }}"
+                    entity_id: "{{ helper_entity }}"
+                    respond_to_read: "{{ respond_to_read }}"
+                    cooldown: "{{ expose_cooldown }}"
+
+  # 2) Mittelwert berechnen (unknown/unavailable rausfiltern + Plausibilitätsgrenzen)
+  - variables:
+      valid_values: >-
+        {% set ns = namespace(vals=[]) %}
+        {% for e in temp_entities %}
+          {% set s = states(e) %}
+          {% if s not in ['unknown','unavailable','none',''] %}
+            {% set v = s | float(none) %}
+            {% if v is not none and v >= (valid_min | float) and v <= (valid_max | float) %}
+              {% set ns.vals = ns.vals + [v] %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.vals }}
+
+      avg: >-
+        {% set vals = valid_values %}
+        {% if (vals | length) >= (min_sources | int) %}
+          {{ (vals | average(none)) | round(decimals | int) }}
+        {% else %}
+          {{ none }}
+        {% endif %}
+
+      current_room: "{{ states(helper_entity) | float(none) }}"
+
+      delta_ok: >-
+        {% if avg is none %}
+          false
+        {% elif current_room is none %}
+          true
+        {% else %}
+          {{ (avg - current_room) | abs >= (min_delta | float) }}
+        {% endif %}
+
+  - choose:
+      - conditions: "{{ avg is not none }}"
+        sequence:
+          # 3) HA-Helper updaten (nur bei echten Änderungen / beim Start)
+          - choose:
+              - conditions: "{{ trigger.id in ['sensors_changed','ha_start'] and delta_ok }}"
+                sequence:
+                  - action: input_number.set_value
+                    target:
+                      entity_id: "{{ helper_entity }}"
+                    data:
+                      value: "{{ avg }}"
+
+          # 4) Optional zyklisch zusätzlich auf KNX schreiben (Heartbeat)
+          - choose:
+              - conditions: "{{ do_periodic and (knx_addresses | length > 0) }}"
+                sequence:
+                  - repeat:
+                      for_each: "{{ knx_addresses }}"
+                      sequence:
+                        - action: knx.send
+                          data:
+                            address: "{{ repeat.item }}"
+                            type: "{{ knx_type }}"
+                            payload: "{{ avg }}"
+                            response: false
+
+          # 5) Wenn Expose NICHT genutzt wird: bei Änderungen sofort knx.send
+          - choose:
+              - conditions: "{{ (not use_expose) and trigger.id in ['sensors_changed','ha_start'] and (knx_addresses | length > 0) }}"
+                sequence:
+                  - repeat:
+                      for_each: "{{ knx_addresses }}"
+                      sequence:
+                        - action: knx.send
+                          data:
+                            address: "{{ repeat.item }}"
+                            type: "{{ knx_type }}"
+                            payload: "{{ avg }}"
+                            response: false
